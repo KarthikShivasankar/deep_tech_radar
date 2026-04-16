@@ -1,0 +1,29 @@
+# Environment / secrets
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Virtual environment (uv creates .venv by default)
+.venv/
+
+# uv.lock IS intentionally committed — do not add it here
+
+# Gradio cache
+gradio_cached_examples/
+flagged/
+
+# Temp exports
+deep_tech_radar_*.csv
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude Code local settings
+.claude/

@@ -1,0 +1,26 @@
+[project]
+name = "deep-tech-skill-radar"
+version = "0.1.0"
+description = "Deep Tech & Skill Radar — interactive skill mapping for research groups"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "gradio>=4.44.0",
+    "python-dotenv>=1.0.0",
+    "datasets>=3.0.0",
+    "huggingface_hub>=0.24.0",
+    "plotly>=5.22.0",
+    "pandas>=2.2.0",
+    "numpy>=1.26.0",
+    "requests>=2.32.0",
+    "scholarly>=1.7.11",
+    "openai>=1.0.0",
+]
+
+[project.scripts]
+radar = "app:main"
+
+[tool.uv]
+# Pin the Python version used when uv creates the virtual environment.
+# Change to "3.11" or "3.12" if needed.
+python = "3.10"
