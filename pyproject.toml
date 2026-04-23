@@ -20,7 +20,8 @@ dependencies = [
 [project.scripts]
 radar = "app:main"
 
+[tool.setuptools]
+py-modules = ["app", "ai_agents", "charts", "config", "radar_viz", "scholar", "storage", "utils"]
+
 [tool.uv]
-# Pin the Python version used when uv creates the virtual environment.
-# Change to "3.11" or "3.12" if needed.
-python = "3.10"
+python-version = "3.10"

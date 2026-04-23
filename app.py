@@ -1,30 +1,30 @@
 """
-app.py — Deep Tech & Skill Radar (Gradio app).
+app.py — Deep Tech & Skill Radar (Gradio app) — Simplified 3-Click UX.
 
 Tabs:
-  1. Profile & Scholar Lookup   — select name, fetch or enter research tags
-  2. Skill Radar Assessment     — rate each tech area on 3 dimensions; live radar
-  3. Deep Tech Vision           — free-text views on what "deep tech" means
-  4. Submit & Preview           — JSON preview + submit to HuggingFace dataset
-  5. Group Dashboard            — aggregate charts; individual comparison; export
-  6. Technology Radar           — ThoughtWorks-style quadrant+ring radar
-                                   Group view = Technology Radar (collective adoption)
-                                   Individual view = Skill Radar (personal proficiency)
-  7. AI Research Assistant      — Ollama-powered agents: synergies, ideas, proposals
+  1. My Radar           — select name → auto-fetch Scholar → radar preview → submit
+  2. Group Dashboard    — aggregate charts; individual comparison; export
+  3. Technology Radar   — ThoughtWorks-style quadrant+ring radar
+  4. AI Insights        — OpenAI-powered agents: synergies, ideas, proposals
 
-Session persistence:
-  Selecting a name auto-loads any previous submission from the HF dataset,
-  pre-populating all sliders, tags, and vision text.  A returning user only
-  needs to adjust what has changed.
+User flow (Scholar path):
+  1. Select name from dropdown  →  Scholar data fetched automatically
+  2. (Optional) Open "Fine-tune" accordion and adjust sliders
+  3. Click "Confirm & Submit"
+
+User flow (no Scholar):
+  1. Select name  →  text form appears
+  2. Type research description
+  3. Click "Auto-generate"  →  radar preview
+  4. Click "Confirm & Submit"
 
 Run locally:
-    python app.py                     # http://localhost:7860
-    python app.py --share             # temporary public URL
+    python app.py          # http://localhost:7860
+    python app.py --share  # temporary public URL
 """
 
 from __future__ import annotations
 
-import json
 import logging
 import sys
 from typing import Optional
@@ -41,9 +41,8 @@ from config import (
     APP_TITLE,
     DEFAULT_TECH_AREAS,
     DIMENSIONS,
-    MAX_AREAS,
-    MAX_CUSTOM_AREAS,
     OLLAMA_MODEL,
+    OPENAI_MODEL,
     SLIDER_DEFAULT,
     SLIDER_MAX,
     SLIDER_MIN,
@@ -51,306 +50,223 @@ from config import (
     TW_QUADRANTS,
 )
 from utils import (
-    build_active_tech_areas,
     build_submission_record,
-    ratings_from_sliders,
-    record_to_json_preview,
+    parse_ratings_from_record,
     validate_record,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(name)s  %(message)s")
 log = logging.getLogger(__name__)
 
-# ── Constants ─────────────────────────────────────────────────────────────────
-
-_N_DEFAULT = len(DEFAULT_TECH_AREAS)
 _DROPDOWN_CHOICES = ["— Select your name —"] + sorted(TEAM_MEMBERS) + ["Other (type below)"]
-_DIM_CHOICES      = list(DIMENSIONS.keys())
-_DIM_LABELS       = list(DIMENSIONS.values())
+_N_AREAS = len(DEFAULT_TECH_AREAS)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Event handlers
+# Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _safe_name(raw: str) -> str:
-    """Strip whitespace; return empty string for placeholder selections."""
     if not raw or raw.startswith("—"):
         return ""
     return raw.strip()
 
 
-def on_researcher_selected(name_raw: str, custom_name: str):
-    """
-    Triggered when the researcher dropdown changes.
+def _default_ratings() -> dict[str, dict[str, int]]:
+    return {a: {d: SLIDER_DEFAULT for d in DIMENSIONS} for a in DEFAULT_TECH_AREAS}
 
-    Loads any existing session from the HF dataset and returns Gradio
-    update objects to pre-populate all form components.
 
-    Returns a tuple of 66 values (must match the outputs list below).
+def _ratings_to_slider_updates(ratings: dict) -> list:
+    """Convert ratings dict to 30 gr.update(value=v) objects: interest×10, expertise×10, contribute×10."""
+    updates = []
+    for dim in ("interest", "expertise", "contribute"):
+        for area in DEFAULT_TECH_AREAS:
+            v = ratings.get(area, {}).get(dim, SLIDER_DEFAULT)
+            updates.append(gr.update(value=int(v)))
+    return updates
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tab 1 event handlers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def on_name_selected(name_raw: str, url_map: dict):
     """
-    name = _safe_name(name_raw) or _safe_name(custom_name)
+    Fires immediately when researcher dropdown changes.
+    Auto-fetches Scholar data and populates the radar.
+    Returns 37 values: 7 main + 30 slider updates.
+    """
+    name = _safe_name(name_raw)
     if not name:
-        return _default_session_outputs()
+        empty_fig = charts.empty_figure("Select your name to see your radar")
+        return (
+            "_Select your name above to begin._",
+            _default_ratings(), "manual", [], empty_fig,
+            gr.update(visible=False),   # no_scholar_section
+            gr.update(visible=False),   # fine_tune_accordion
+            *_ratings_to_slider_updates(_default_ratings()),
+        )
 
+    # Try restoring a previous session first
     session = storage.load_researcher_session(name)
     if session:
-        return _restore_session_outputs(name, session)
-    return _default_session_outputs(name=name, msg=f"No previous session for '{name}' — starting fresh.")
-
-
-def _default_session_outputs(name: str = "", msg: str = ""):
-    """
-    Return default (blank) output tuple for a new researcher.
-    """
-    areas        = list(DEFAULT_TECH_AREAS) + [None] * MAX_CUSTOM_AREAS
-    interest     = [SLIDER_DEFAULT] * MAX_AREAS
-    expertise    = [SLIDER_DEFAULT] * MAX_AREAS
-    contribute   = [SLIDER_DEFAULT] * MAX_AREAS
-    acc_updates  = [
-        gr.update(
-            label=DEFAULT_TECH_AREAS[i] if i < _N_DEFAULT else f"Custom Area {i - _N_DEFAULT + 1}",
-            visible=(i < _N_DEFAULT),
+        ratings  = parse_ratings_from_record(session, DEFAULT_TECH_AREAS)
+        date     = str(session.get("submitted_at", ""))[:10]
+        tags     = session.get("scholar_tags") or []
+        source   = session.get("scholar_source", "manual")
+        status   = (
+            f"**Previous submission restored** ({date}).  "
+            f"Scholar data re-fetched in the background.  "
+            f"Click **Confirm & Submit** to save any changes."
         )
-        for i in range(MAX_AREAS)
-    ]
-    status = msg or ("Enter your name below and click 'Lookup' to fetch research tags."
-                     if not name else "")
-    return (
-        areas,                                          # → current_areas_state
-        "manual",                                       # → scholar_source_state
-        status,                                         # → session_status_msg
-        gr.update(choices=[], value=[]),                # → tags_cg
-        [], "",                                         # → tag_choices_state, tag_input
-        "", "", "",                                     # → vision_def, vision_ex, vision_exp
-        *acc_updates,                                   # → *area_accordions  (15)
-        *[gr.update(value=v) for v in interest],        # → *interest_sliders (15)
-        *[gr.update(value=v) for v in expertise],       # → *expertise_sliders(15)
-        *[gr.update(value=v) for v in contribute],      # → *contribute_sliders(15)
-    )
+        fig = charts.build_realtime_radar_preview(DEFAULT_TECH_AREAS, ratings)
+        return (
+            status, ratings, source, tags, fig,
+            gr.update(visible=False),   # no_scholar_section
+            gr.update(visible=True),    # fine_tune_accordion
+            *_ratings_to_slider_updates(ratings),
+        )
 
+    # No session — fetch from Scholar
+    scholar_url = (url_map or {}).get(name, "")
+    status_msg  = f"Fetching research profile for **{name}**…"
 
-def _restore_session_outputs(name: str, session: dict):
-    """
-    Build output tuple from a loaded session dict.
-    """
-    raw_areas = session.get("tech_areas_used") or list(DEFAULT_TECH_AREAS)
-    if isinstance(raw_areas, str):
-        try:
-            raw_areas = json.loads(raw_areas)
-        except Exception:
-            raw_areas = list(DEFAULT_TECH_AREAS)
+    result = scholar.lookup_researcher(name, scholar_url)
+    tags   = result.get("tags", [])
+    source = result.get("source", "manual")
 
-    # Fill to MAX_AREAS slots
-    areas: list[Optional[str]] = (list(raw_areas) + [None] * MAX_AREAS)[:MAX_AREAS]
-
-    interest   = [SLIDER_DEFAULT] * MAX_AREAS
-    expertise  = [SLIDER_DEFAULT] * MAX_AREAS
-    contribute = [SLIDER_DEFAULT] * MAX_AREAS
-
-    acc_updates = []
-    for i in range(MAX_AREAS):
-        area = areas[i]
-        if area:
-            interest[i]   = int(session.get(f"area_{i}_interest")  or SLIDER_DEFAULT)
-            expertise[i]  = int(session.get(f"area_{i}_expertise") or SLIDER_DEFAULT)
-            contribute[i] = int(session.get(f"area_{i}_contribute") or SLIDER_DEFAULT)
-            acc_updates.append(gr.update(label=area, visible=True))
+    if tags:
+        # Use rich data if available (Semantic Scholar)
+        rich = result.get("rich_data")
+        if rich and rich.get("paper_area_counts"):
+            ratings = scholar.auto_rate_from_rich_data(rich)
         else:
-            label = (DEFAULT_TECH_AREAS[i] if i < _N_DEFAULT
-                     else f"Custom Area {i - _N_DEFAULT + 1}")
-            acc_updates.append(gr.update(label=label, visible=(i < _N_DEFAULT)))
+            ratings = scholar.auto_rate_from_tags(tags)
 
-    tags = session.get("scholar_tags") or []
-    if isinstance(tags, str):
-        try:
-            tags = json.loads(tags)
-        except Exception:
-            tags = []
+        pc = result.get("paper_count", 0)
+        hi = result.get("h_index", 0)
+        ci = result.get("citation_count", 0)
+        src_label = source.replace("_", " ").title()
 
-    source  = session.get("scholar_source", "manual")
-    date    = str(session.get("submitted_at", ""))[:10]
-    status  = f"Session restored for '{name}' (last saved: {date}). Review and update below."
+        metrics = []
+        if pc:  metrics.append(f"{pc} papers")
+        if hi:  metrics.append(f"h-index {hi}")
+        if ci:  metrics.append(f"{ci} citations")
 
+        status_msg = (
+            f"**Auto-generated from {src_label}**"
+            + (f" — {', '.join(metrics)}" if metrics else "")
+            + ".  Adjust sliders below if needed, then click **Confirm & Submit**."
+        )
+        has_scholar = True
+    else:
+        ratings    = _default_ratings()
+        status_msg = (
+            f"No Scholar profile found for **{name}**.  "
+            f"Describe your research interests below and click **Auto-generate**."
+        )
+        has_scholar = False
+
+    fig = charts.build_realtime_radar_preview(DEFAULT_TECH_AREAS, ratings)
     return (
-        areas,                                          # → current_areas_state
-        source,                                         # → scholar_source_state
-        status,                                         # → session_status_msg
-        gr.update(choices=tags, value=tags),            # → tags_cg
-        tags, "",                                       # → tag_choices_state, tag_input
-        session.get("vision_definition") or "",         # → vision_def
-        session.get("vision_examples")   or "",         # → vision_ex
-        session.get("vision_explore")    or "",         # → vision_exp
-        *acc_updates,                                   # → *area_accordions  (15)
-        *[gr.update(value=v) for v in interest],        # → *interest_sliders (15)
-        *[gr.update(value=v) for v in expertise],       # → *expertise_sliders(15)
-        *[gr.update(value=v) for v in contribute],      # → *contribute_sliders(15)
+        status_msg, ratings, source, tags, fig,
+        gr.update(visible=not has_scholar),   # no_scholar_section
+        gr.update(visible=has_scholar),       # fine_tune_accordion
+        *_ratings_to_slider_updates(ratings),
     )
 
 
-def on_scholar_lookup(name_raw: str, custom_name: str, scholar_url: str):
-    """
-    Triggered by 'Lookup Research Profile' button.
-
-    Queries Semantic Scholar and/or Google Scholar and returns tag choices.
-    """
-    name = _safe_name(name_raw) or _safe_name(custom_name)
-    if not name:
-        return "manual", [], gr.update(choices=[], value=[]), "Please enter your name first.", "–"
-
-    result = scholar.lookup_researcher(name, scholar_url or "")
-    tags   = result["tags"]
-    source = result["source"]
-    count  = result.get("paper_count", 0)
-    error  = result.get("error", "")
-
-    status = f"Found {len(tags)} tag(s) via {source.replace('_', ' ')}"
-    if count:
-        status += f"  •  {count} papers indexed"
-    if error:
-        status += f"  •  Note: {error}"
-
+def on_infer_from_text(text: str):
+    """Auto-generate ratings from free-text research description."""
+    if not text.strip():
+        return (
+            _default_ratings(),
+            charts.empty_figure("Enter your research description first"),
+            "Please enter some text about your research interests.",
+            gr.update(visible=False),
+            *_ratings_to_slider_updates(_default_ratings()),
+        )
+    ratings  = scholar.infer_ratings_from_text(text)
+    fig      = charts.build_realtime_radar_preview(DEFAULT_TECH_AREAS, ratings)
+    status   = "**Radar generated from your description.** Adjust sliders if needed, then click **Confirm & Submit**."
     return (
-        source,                                        # → scholar_source_state
-        tags,                                          # → tag_choices_state
-        gr.update(choices=tags, value=tags),           # → tags_cg
-        status,                                        # → scholar_status_msg
-        str(count) if count else "–",                  # → paper_count_txt
+        ratings, fig, status,
+        gr.update(visible=True),   # show fine_tune_accordion
+        *_ratings_to_slider_updates(ratings),
     )
 
 
-def on_add_manual_tag(tag_text: str, current_choices: list):
-    """Add a manually typed tag to the CheckboxGroup."""
-    tag = (tag_text or "").strip()
-    if not tag:
-        return current_choices, gr.update(), ""
-    new_choices = current_choices + [tag] if tag not in current_choices else current_choices
-    return new_choices, gr.update(choices=new_choices, value=new_choices), ""
+def on_reinfer_from_scholar(tags: list, url_map: dict, name_raw: str):
+    """Reset ratings to Scholar-inferred values (discards manual slider changes)."""
+    name = _safe_name(name_raw)
+    scholar_url = (url_map or {}).get(name, "")
+    result  = scholar.lookup_researcher(name, scholar_url) if name else {}
+    fresh_tags = result.get("tags", tags or [])
+    rich = result.get("rich_data") if result else None
+    if rich and rich.get("paper_area_counts"):
+        ratings = scholar.auto_rate_from_rich_data(rich)
+    elif fresh_tags:
+        ratings = scholar.auto_rate_from_tags(fresh_tags)
+    else:
+        ratings = _default_ratings()
+    fig = charts.build_realtime_radar_preview(DEFAULT_TECH_AREAS, ratings)
+    return ratings, fig, *_ratings_to_slider_updates(ratings)
 
 
-def on_add_custom_area(area_name: str, current_areas: list):
-    """
-    Triggered by 'Add Custom Area' button.
-
-    Finds the next empty custom slot (index >= _N_DEFAULT) and activates it.
-    Returns updated state + accordion updates.
-    """
-    area_name = (area_name or "").strip()
-    if not area_name:
-        return (current_areas, "Please enter an area name.", "") + tuple(gr.update() for _ in range(MAX_AREAS))
-
-    new_areas = list(current_areas)
-    acc_updates = [gr.update() for _ in range(MAX_AREAS)]
-    added = False
-
-    for i in range(_N_DEFAULT, MAX_AREAS):
-        if new_areas[i] is None:
-            new_areas[i] = area_name
-            acc_updates[i] = gr.update(label=area_name, visible=True)
-            added = True
-            break
-
-    msg = f"Added '{area_name}' to your assessment." if added else \
-          f"All {MAX_CUSTOM_AREAS} custom slots are filled."
-
-    return (new_areas, msg, "") + tuple(acc_updates)
-
-
-def on_remove_custom_area(current_areas: list):
-    """Remove the last non-None custom area slot."""
-    new_areas   = list(current_areas)
-    acc_updates = [gr.update() for _ in range(MAX_AREAS)]
-
-    for i in range(MAX_AREAS - 1, _N_DEFAULT - 1, -1):
-        if new_areas[i] is not None:
-            removed = new_areas[i]
-            new_areas[i] = None
-            acc_updates[i] = gr.update(
-                label=f"Custom Area {i - _N_DEFAULT + 1}",
-                visible=False,
-            )
-            return (new_areas, f"Removed '{removed}'.", *acc_updates)
-
-    return (new_areas, "No custom areas to remove.", *acc_updates)
-
-
-def on_slider_change(current_areas: list, *slider_vals):
-    """
-    Triggered by any slider change — rebuilds the live radar preview.
-
-    slider_vals order: [interest_0..14, expertise_0..14, contribute_0..14]
-    """
-    n = MAX_AREAS
+def on_slider_change(current_ratings: dict, *slider_vals):
+    """Rebuild ratings from live slider positions and refresh radar preview."""
+    n = _N_AREAS
     interest_vals   = list(slider_vals[:n])
     expertise_vals  = list(slider_vals[n:2 * n])
-    contribute_vals = list(slider_vals[2 * n:])
+    contribute_vals = list(slider_vals[2 * n:3 * n])
 
-    ratings    = ratings_from_sliders(current_areas, interest_vals, expertise_vals, contribute_vals)
-    active     = build_active_tech_areas(current_areas)
-    active_rat = {a: ratings[a] for a in active if a in ratings}
+    new_ratings: dict[str, dict[str, int]] = {}
+    for i, area in enumerate(DEFAULT_TECH_AREAS):
+        new_ratings[area] = {
+            "interest":   int(interest_vals[i])   if i < len(interest_vals)   else SLIDER_DEFAULT,
+            "expertise":  int(expertise_vals[i])  if i < len(expertise_vals)  else SLIDER_DEFAULT,
+            "contribute": int(contribute_vals[i]) if i < len(contribute_vals) else SLIDER_DEFAULT,
+        }
+    fig = charts.build_realtime_radar_preview(DEFAULT_TECH_AREAS, new_ratings)
+    return new_ratings, fig
 
-    return charts.build_realtime_radar_preview(active, active_rat)
 
-
-def on_generate_preview(
-    name_raw: str, custom_name: str,
-    tags_value: list,
-    scholar_source: str,
-    current_areas: list,
+def on_confirm_submit(
+    name_raw: str, scholar_tags: list, scholar_source: str,
+    current_ratings: dict,
     vision_def: str, vision_ex: str, vision_exp: str,
-    *slider_vals,
-) -> tuple[str, str]:
-    """Build JSON preview of the submission record."""
-    name = _safe_name(name_raw) or _safe_name(custom_name)
+):
+    """Build full record and save to HuggingFace dataset."""
+    name = _safe_name(name_raw)
     if not name:
-        return "", "Please select or enter your name first."
-
-    n = MAX_AREAS
-    ratings = ratings_from_sliders(
-        current_areas,
-        list(slider_vals[:n]),
-        list(slider_vals[n:2 * n]),
-        list(slider_vals[2 * n:]),
-    )
-    active = build_active_tech_areas(current_areas)
+        return "**Please select your name first.**"
+    if not current_ratings:
+        return "**No ratings found — please select your name and let the radar load.**"
 
     record = build_submission_record(
         name=name,
-        scholar_tags=tags_value or [],
+        scholar_tags=scholar_tags or [],
         scholar_source=scholar_source or "manual",
-        ratings=ratings,
-        tech_areas=active,
-        vision_definition=vision_def,
-        vision_examples=vision_ex,
-        vision_explore=vision_exp,
+        ratings=current_ratings,
+        tech_areas=DEFAULT_TECH_AREAS,
+        vision_definition=vision_def or "",
+        vision_examples=vision_ex or "",
+        vision_explore=vision_exp or "",
     )
 
     valid, errors = validate_record(record)
     if not valid:
-        return "", "Validation errors:\n• " + "\n• ".join(errors)
-
-    return record_to_json_preview(record), "Preview generated. Review and click Submit."
-
-
-def on_submit(preview_json: str) -> str:
-    """Parse the preview JSON and save to HuggingFace dataset."""
-    if not preview_json or not preview_json.strip():
-        return "Nothing to submit — generate a preview first."
-    try:
-        record = json.loads(preview_json)
-    except json.JSONDecodeError as exc:
-        return f"Preview JSON is malformed: {exc}"
-
-    valid, errors = validate_record(record)
-    if not valid:
-        return "Cannot submit — validation errors:\n• " + "\n• ".join(errors)
+        return "**Validation errors:**\n• " + "\n• ".join(errors)
 
     success, message = storage.upsert_submission(record)
-    return ("✓ " if success else "✗ ") + message
+    return ("**✓ " if success else "**✗ ") + message + "**"
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tab 2 event handlers (Group Dashboard — unchanged)
+# ─────────────────────────────────────────────────────────────────────────────
 
 def on_dashboard_refresh(dimension: str):
-    """Reload all dashboard charts from the HF dataset."""
     df          = storage.get_all_radar_data()
     vision_data = storage.get_all_vision_data()
     summary     = storage.get_submission_summary()
@@ -372,87 +288,57 @@ def on_dashboard_refresh(dimension: str):
     return (
         agg_radar, heatmap, contrib_bar, bubble,
         voices_md, status_md,
-        gr.update(choices=names, value=names[0] if names else None),  # → individual researcher dropdown
+        gr.update(choices=names, value=names[0] if names else None),
     )
 
 
-def on_individual_researcher_change(
-    researcher_name: Optional[str],
-    dimension: str,
-) -> tuple:
-    """Update individual radar and dimension comparison when researcher/dim changes."""
+def on_individual_researcher_change(researcher_name: Optional[str], dimension: str):
     if not researcher_name:
         placeholder = charts.empty_figure("Select a researcher above")
         return placeholder, placeholder
 
     df = storage.get_all_radar_data()
     if df.empty:
-        placeholder = charts.empty_figure("No data yet")
-        return placeholder, placeholder
+        return charts.empty_figure("No data yet"), charts.empty_figure("No data yet")
 
     sub = df[df["researcher"] == researcher_name]
     if sub.empty:
-        placeholder = charts.empty_figure(f"No data for {researcher_name}")
-        return placeholder, placeholder
+        return charts.empty_figure(f"No data for {researcher_name}"), charts.empty_figure("")
 
-    # Rebuild ratings dict from long-form data
-    tech_areas = sub["tech_area"].tolist()
-    ratings    = {
+    ratings = {
         row["tech_area"]: {dim: row.get(dim) for dim in DIMENSIONS}
         for _, row in sub.iterrows()
     }
-
-    radar  = charts.build_individual_radar(researcher_name, tech_areas, ratings, dimension or None)
-    bars   = charts.build_dimension_comparison(researcher_name, tech_areas, ratings)
+    tech_areas = sub["tech_area"].tolist()
+    radar = charts.build_individual_radar(researcher_name, tech_areas, ratings, dimension or None)
+    bars  = charts.build_dimension_comparison(researcher_name, tech_areas, ratings)
     return radar, bars
 
 
-def on_overlay_update(
-    selected_researchers: list,
-    dimension: str,
-) -> go.Figure:
-    """Rebuild the researcher overlay radar when selection changes."""
+def on_overlay_update(selected_researchers: list, dimension: str):
     df = storage.get_all_radar_data()
-    return charts.build_overlay_radar(
-        df,
-        dimension=dimension or "interest",
-        researchers=selected_researchers or None,
-    )
+    return charts.build_overlay_radar(df, dimension=dimension or "interest", researchers=selected_researchers or None)
 
 
-def on_export_csv() -> str:
-    """Export the full dataset to a temp CSV file for download."""
+def on_export_csv():
     path = storage.export_to_csv()
-    if not path:
-        return None   # gr.File handles None gracefully
-    return path
+    return path if path else None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Tab 6 — Technology Radar handlers
+# Tab 3 event handlers (Technology Radar — unchanged)
 # ─────────────────────────────────────────────────────────────────────────────
-
-def _list_custom_areas(df) -> list[str]:
-    """Return tech areas in the data that are not assigned to any TW quadrant."""
-    return radar_viz.get_custom_areas(df)
-
 
 def on_tw_view_change(view: str):
-    """Show/hide the researcher dropdown based on Group vs Individual view."""
     return gr.update(visible=(view == "Individual"))
 
 
 def on_tw_radar_refresh(view: str, researcher: Optional[str], dimension: str):
-    """
-    Reload the TW radar and blip legend.
-    - Group view → Technology Radar (collective adoption/readiness per area)
-    - Individual view → Skill Radar (personal proficiency for selected researcher)
-    """
     df      = storage.get_all_radar_data()
     dim     = dimension or "contribute"
     fig     = radar_viz.build_tw_radar(df, view.lower(), researcher or None, dim)
     legend  = radar_viz.build_blip_legend(fig, view.lower())
-    custom  = _list_custom_areas(df)
+    custom  = radar_viz.get_custom_areas(df)
     custom_md = (
         "**Custom areas** (not yet assigned to a quadrant): " + ", ".join(custom)
         if custom else ""
@@ -463,31 +349,20 @@ def on_tw_radar_refresh(view: str, researcher: Optional[str], dimension: str):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Tab 7 — AI Research Assistant handlers
+# Tab 4 event handlers (AI Insights)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def stream_agent_response(agent_name: str, extra: str):
-    """
-    Stream an AI agent response into gr.Markdown.
-
-    Yields (ollama_status, ai_output) tuples.  The status clears on success;
-    shows an error message if Ollama is unreachable.
-    """
-    ok, msg = ai_agents.check_ollama()
+    """Stream OpenAI response into gr.Markdown."""
+    ok, msg = ai_agents.check_openai()
     if not ok:
-        yield (
-            f"⚠ **Ollama not reachable:** {msg}\n\n"
-            "**To start Ollama:**\n```\nollama serve\n```\n"
-            f"**To pull the model:**\n```\nollama pull {OLLAMA_MODEL}\n```",
-            "",
-        )
+        yield f"⚠ **OpenAI not configured:** {msg}\n\nSet `OPENAI_API_KEY` in `.env`.", ""
         return
 
     df          = storage.get_all_radar_data()
     vision_data = storage.get_all_vision_data()
-
-    fn = ai_agents.AGENT_FUNCTIONS.get(agent_name, ai_agents.stream_synergies)
-    for text in fn(df, vision_data, extra or ""):   # type: ignore[operator]
+    fn          = ai_agents.AGENT_FUNCTIONS.get(agent_name, ai_agents.stream_synergies)
+    for text in fn(df, vision_data, extra or ""):
         yield "", text
 
 
@@ -495,36 +370,29 @@ def stream_agent_response(agent_name: str, extra: str):
 # App layout
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_app() -> gr.Blocks:   # noqa: C901 — intentionally long UI builder
-    theme = gr.themes.Soft(
-        primary_hue="blue",
-        secondary_hue="teal",
-        neutral_hue="slate",
-        font=[gr.themes.GoogleFont("Inter"), "sans-serif"],
-    )
+def build_app(url_map: dict) -> gr.Blocks:
 
-    with gr.Blocks(title=APP_TITLE, theme=theme, css=_CSS) as demo:
+    with gr.Blocks(title=APP_TITLE) as demo:
 
-        # ── Shared state ─────────────────────────────────────────────────
-        # current_areas_state: 15-slot list, None for unused custom slots
-        current_areas_state  = gr.State(list(DEFAULT_TECH_AREAS) + [None] * MAX_CUSTOM_AREAS)
-        scholar_source_state = gr.State("manual")
-        tag_choices_state    = gr.State([])   # all available tag choices
+        # ── Shared state ─────────────────────────────────────────────────────
+        current_ratings_state = gr.State(_default_ratings())
+        scholar_source_state  = gr.State("manual")
+        scholar_tags_state    = gr.State([])
+        scholar_url_map_state = gr.State(url_map)
 
-        # ── Header ───────────────────────────────────────────────────────
+        # ── Header ────────────────────────────────────────────────────────────
         gr.Markdown(f"# {APP_TITLE}\n{APP_SUBTITLE}", elem_classes=["app-header"])
 
-        with gr.Tabs() as tabs:
+        with gr.Tabs():
 
             # ═══════════════════════════════════════════════════════════════
-            # TAB 1 — Profile & Scholar Lookup
+            # TAB 1 — My Radar (the main submission tab)
             # ═══════════════════════════════════════════════════════════════
-            with gr.Tab("1 · Profile & Scholar Lookup", id="tab_profile"):
+            with gr.Tab("1 · My Radar", id="tab_myradar"):
 
                 gr.Markdown(
-                    "Select your name to **auto-restore a previous session**, "
-                    "then click **Lookup** to fetch research tags from Semantic Scholar "
-                    "or Google Scholar.  You can also add tags manually."
+                    "Select your name — your radar is **auto-generated from your Scholar profile**.  "
+                    "Fine-tune the sliders if needed, then click **Confirm & Submit**."
                 )
 
                 with gr.Row():
@@ -532,256 +400,145 @@ def build_app() -> gr.Blocks:   # noqa: C901 — intentionally long UI builder
                         choices=_DROPDOWN_CHOICES,
                         value=_DROPDOWN_CHOICES[0],
                         label="Select Researcher",
-                        allow_custom_value=False,
-                        scale=2,
-                    )
-                    custom_name_tb = gr.Textbox(
-                        label="Or type a name (if not listed above)",
-                        placeholder="e.g. Jane Smith",
-                        scale=2,
+                        allow_custom_value=True,
+                        scale=3,
                     )
 
-                session_status_msg = gr.Markdown("_Select your name to begin._", elem_classes=["status-info"])
-
-                with gr.Row():
-                    scholar_url_tb = gr.Textbox(
-                        label="Google Scholar Profile URL  (optional)",
-                        placeholder="https://scholar.google.com/citations?user=XXXX",
-                        scale=4,
-                    )
-                    lookup_btn = gr.Button("Lookup Research Profile", variant="primary", scale=1)
-
-                with gr.Row():
-                    scholar_status_msg = gr.Textbox(
-                        label="Lookup Status", interactive=False, scale=4
-                    )
-                    paper_count_txt = gr.Textbox(
-                        label="Papers found", interactive=False, scale=1, value="–"
-                    )
-
-                gr.Markdown("#### Research Tags")
-                gr.Markdown(
-                    "Auto-fetched tags appear below — uncheck any you want to exclude, "
-                    "or add your own using the field at the right."
-                )
-                with gr.Row():
-                    tags_cg = gr.CheckboxGroup(
-                        label="Included tags",
-                        choices=[],
-                        value=[],
-                        interactive=True,
-                        scale=4,
-                    )
-                    with gr.Column(scale=1):
-                        tag_input  = gr.Textbox(label="Add custom tag", placeholder="e.g. Federated Learning")
-                        add_tag_btn = gr.Button("Add tag", size="sm")
-
-            # ═══════════════════════════════════════════════════════════════
-            # TAB 2 — Skill Radar Assessment
-            # ═══════════════════════════════════════════════════════════════
-            with gr.Tab("2 · Skill Radar Assessment", id="tab_radar"):
-
-                gr.Markdown(
-                    "Rate each deep tech area on three dimensions.  "
-                    "The radar chart on the right updates as you move the sliders."
+                fetch_status_md = gr.Markdown(
+                    "_Select your name above to begin._",
+                    elem_classes=["status-info"],
                 )
 
-                with gr.Row():
+                # ── Live radar preview ────────────────────────────────────
+                radar_preview = gr.Plot(
+                    value=charts.empty_figure("Select your name to see your radar"),
+                    label="Your Skill Radar",
+                    elem_classes=["radar-container"],
+                )
 
-                    # ── Left column: sliders ──────────────────────────────
-                    with gr.Column(scale=3):
-
-                        # Custom area controls
-                        with gr.Row(equal_height=True):
-                            custom_area_input = gr.Textbox(
-                                label="Add custom tech area",
-                                placeholder="e.g. Quantum Computing",
-                                scale=3,
-                            )
-                            add_area_btn    = gr.Button("Add area", variant="secondary", scale=1)
-                            remove_area_btn = gr.Button("Remove last", variant="stop", scale=1)
-
-                        area_add_status = gr.Markdown("", elem_classes=["status-info"])
-
-                        # Pre-render all 15 accordion groups
-                        area_accordions  : list[gr.Accordion] = []
-                        interest_sliders : list[gr.Slider]    = []
-                        expertise_sliders: list[gr.Slider]    = []
-                        contribute_sliders: list[gr.Slider]   = []
-
-                        for i in range(MAX_AREAS):
-                            is_default = i < _N_DEFAULT
-                            label      = DEFAULT_TECH_AREAS[i] if is_default else f"Custom Area {i - _N_DEFAULT + 1}"
-
-                            with gr.Accordion(
-                                label=label,
-                                open=is_default,
-                                visible=is_default,
-                            ) as acc:
-                                int_s = gr.Slider(
-                                    SLIDER_MIN, SLIDER_MAX,
-                                    value=SLIDER_DEFAULT, step=1,
-                                    label="Interest Level  (1 = none  →  5 = very high)",
-                                    info="How interested are you in this area?",
-                                )
-                                exp_s = gr.Slider(
-                                    SLIDER_MIN, SLIDER_MAX,
-                                    value=SLIDER_DEFAULT, step=1,
-                                    label="Current Expertise  (1 = novice  →  5 = expert)",
-                                    info="What is your current technical depth?",
-                                )
-                                con_s = gr.Slider(
-                                    SLIDER_MIN, SLIDER_MAX,
-                                    value=SLIDER_DEFAULT, step=1,
-                                    label="Desire to Contribute  (1 = unlikely  →  5 = strongly)",
-                                    info="How much do you want to work in this area?",
-                                )
-
-                            area_accordions.append(acc)
-                            interest_sliders.append(int_s)
-                            expertise_sliders.append(exp_s)
-                            contribute_sliders.append(con_s)
-
-                    # ── Right column: live radar ──────────────────────────
-                    with gr.Column(scale=2):
-                        radar_preview = gr.Plot(
-                            value=charts.build_realtime_radar_preview(
-                                DEFAULT_TECH_AREAS,
-                                {a: {d: SLIDER_DEFAULT for d in DIMENSIONS} for a in DEFAULT_TECH_AREAS},
+                # ── No-Scholar fallback (hidden until needed) ─────────────
+                with gr.Row(visible=False) as no_scholar_section:
+                    with gr.Column():
+                        gr.Markdown(
+                            "**No Scholar profile found.**  "
+                            "Describe your research interests and past work below — "
+                            "the radar will be auto-generated from your description."
+                        )
+                        research_text_tb = gr.Textbox(
+                            label="Your research interests & past work",
+                            placeholder=(
+                                "e.g. I work on machine learning for IoT security, "
+                                "specifically federated learning for anomaly detection on edge devices. "
+                                "I have a background in software engineering and privacy engineering."
                             ),
-                            label="Live Radar Preview",
-                            show_label=True,
+                            lines=6,
+                        )
+                        with gr.Row():
+                            infer_text_btn       = gr.Button("Auto-generate radar from description", variant="primary")
+                            text_infer_status_md = gr.Markdown("", elem_classes=["status-info"])
+
+                # ── Fine-tune accordion (hidden until Scholar data loads) ──
+                with gr.Accordion("Fine-tune ratings  (expand to adjust)", open=False, visible=False) as fine_tune_accordion:
+
+                    with gr.Row():
+                        reinfer_btn = gr.Button(
+                            "Re-infer from Scholar data",
+                            variant="secondary", size="sm",
                         )
                         gr.Markdown(
-                            "<small>The chart shows **all three dimensions** simultaneously. "
-                            "Blue = Interest, Green = Expertise, Orange = Contribute.</small>",
+                            "<small>Sliders are pre-filled from your Scholar profile.  "
+                            "Open an area below to override.</small>",
                             elem_classes=["legend-note"],
                         )
 
-            # ═══════════════════════════════════════════════════════════════
-            # TAB 3 — Deep Tech Vision
-            # ═══════════════════════════════════════════════════════════════
-            with gr.Tab("3 · Deep Tech Vision", id="tab_vision"):
+                    area_accordions:   list[gr.Accordion] = []
+                    interest_sliders:  list[gr.Slider]    = []
+                    expertise_sliders: list[gr.Slider]    = []
+                    contribute_sliders: list[gr.Slider]   = []
 
-                gr.Markdown(
-                    "Share your personal perspective on deep tech.  "
-                    "These open-ended responses are displayed on the group dashboard "
-                    "and help the team align on shared goals."
+                    for i, area in enumerate(DEFAULT_TECH_AREAS):
+                        with gr.Accordion(label=area, open=False) as acc:
+                            int_s = gr.Slider(SLIDER_MIN, SLIDER_MAX, value=SLIDER_DEFAULT, step=1,
+                                              label="Interest", info="1 = none  →  5 = very high")
+                            exp_s = gr.Slider(SLIDER_MIN, SLIDER_MAX, value=SLIDER_DEFAULT, step=1,
+                                              label="Expertise", info="1 = novice  →  5 = expert")
+                            con_s = gr.Slider(SLIDER_MIN, SLIDER_MAX, value=SLIDER_DEFAULT, step=1,
+                                              label="Contribute", info="1 = unlikely  →  5 = strongly")
+                        area_accordions.append(acc)
+                        interest_sliders.append(int_s)
+                        expertise_sliders.append(exp_s)
+                        contribute_sliders.append(con_s)
+
+                # ── Optional vision context ───────────────────────────────
+                with gr.Accordion("Add research vision context  (optional)", open=False):
+                    vision_def_tb = gr.Textbox(
+                        label="What do you think deep tech is?",
+                        lines=3, max_lines=10,
+                        placeholder="In my view, deep tech refers to…",
+                    )
+                    vision_ex_tb = gr.Textbox(
+                        label="Examples of deep tech from your work",
+                        lines=3, max_lines=10,
+                        placeholder="e.g. AI-assisted code analysis, federated learning at the edge…",
+                    )
+                    vision_exp_tb = gr.Textbox(
+                        label="Which deep tech area do you most want to explore next?",
+                        lines=2, max_lines=6,
+                        placeholder="e.g. LLM-driven digital twins…",
+                    )
+
+                # ── Submit ────────────────────────────────────────────────
+                submit_btn = gr.Button(
+                    "Confirm & Submit",
+                    variant="primary",
+                    elem_classes=["submit-btn-large"],
                 )
-
-                vision_def_tb = gr.Textbox(
-                    label="What do you think deep tech is?",
-                    lines=5, max_lines=20,
-                    placeholder=(
-                        "In my view, deep tech refers to technologies grounded in substantial "
-                        "scientific or engineering advances that take years to mature…"
-                    ),
-                )
-                vision_ex_tb = gr.Textbox(
-                    label="Give examples of deep tech from your work or industry",
-                    lines=5, max_lines=20,
-                    placeholder=(
-                        "E.g. AI-assisted code analysis for technical debt, "
-                        "privacy-preserving federated learning at the edge…"
-                    ),
-                )
-                vision_exp_tb = gr.Textbox(
-                    label="Which deep tech area do you most want to explore next?",
-                    lines=3, max_lines=10,
-                    placeholder="E.g. LLM-driven digital twins for smart manufacturing…",
-                )
-
-            # ═══════════════════════════════════════════════════════════════
-            # TAB 4 — Submit & Preview
-            # ═══════════════════════════════════════════════════════════════
-            with gr.Tab("4 · Submit & Preview", id="tab_submit"):
-
-                gr.Markdown(
-                    "Click **Generate Preview** to assemble your submission as JSON. "
-                    "Review the data, then click **Submit** to save it to the "
-                    "shared HuggingFace dataset.  Submitting again will overwrite "
-                    "your previous entry (upsert)."
-                )
-
-                with gr.Row():
-                    preview_btn = gr.Button("Generate Preview", variant="secondary", scale=1)
-                    submit_btn  = gr.Button("Submit to Dataset", variant="primary",   scale=1)
-
-                preview_status = gr.Markdown("", elem_classes=["status-info"])
-
-                preview_code = gr.Code(
-                    label="Submission Preview (JSON)",
-                    language="json",
-                    interactive=False,
-                    lines=30,
-                )
-
-                submit_status = gr.Markdown("", elem_classes=["status-info"])
+                submit_status_md = gr.Markdown("", elem_classes=["status-info"])
 
             # ═══════════════════════════════════════════════════════════════
-            # TAB 5 — Group Dashboard
+            # TAB 2 — Group Dashboard
             # ═══════════════════════════════════════════════════════════════
-            with gr.Tab("5 · Group Dashboard", id="tab_dashboard"):
+            with gr.Tab("2 · Group Dashboard", id="tab_dashboard"):
 
                 with gr.Row(equal_height=True):
-                    refresh_btn = gr.Button("Refresh Dashboard", variant="primary", scale=1)
+                    refresh_btn  = gr.Button("Refresh Dashboard", variant="primary", scale=1)
+                    _DIM_CHOICES = list(DIMENSIONS.keys())
+                    _DIM_LABELS  = list(DIMENSIONS.values())
                     dim_dropdown = gr.Dropdown(
                         choices=list(zip(_DIM_LABELS, _DIM_CHOICES)),
                         value="interest",
                         label="Dimension",
                         scale=1,
                     )
-                    export_btn = gr.Button("Export CSV", variant="secondary", scale=1)
+                    export_btn  = gr.Button("Export CSV", variant="secondary", scale=1)
                     export_file = gr.File(label="Download CSV", visible=True, scale=1)
 
                 dashboard_status = gr.Markdown("_Click Refresh to load data._")
 
-                with gr.Tabs() as dash_tabs:
-
-                    # ── Sub-tab A: Group Radar ────────────────────────────
+                with gr.Tabs():
                     with gr.Tab("Group Radar"):
                         agg_radar_plot = gr.Plot(
                             value=charts.empty_figure("Click 'Refresh Dashboard' to load"),
                             label="Group Aggregate Radar",
                         )
-
-                    # ── Sub-tab B: Heatmap ────────────────────────────────
                     with gr.Tab("Heatmap"):
                         heatmap_plot = gr.Plot(
                             value=charts.empty_figure("Click 'Refresh Dashboard' to load"),
                             label="Researcher × Area Heatmap",
                         )
-
-                    # ── Sub-tab C: Contribution Priorities ───────────────
                     with gr.Tab("Contribution Priorities"):
                         contrib_bar_plot = gr.Plot(
                             value=charts.empty_figure("Click 'Refresh Dashboard' to load"),
                             label="Most Wanted Contribution Areas",
                         )
-
-                    # ── Sub-tab D: Capability Map ─────────────────────────
                     with gr.Tab("Capability Map"):
                         bubble_plot = gr.Plot(
                             value=charts.empty_figure("Click 'Refresh Dashboard' to load"),
                             label="Interest vs Expertise Bubble Chart",
                         )
-                        gr.Markdown(
-                            "<small>**Bubble size** = desire to contribute.  "
-                            "Areas in the **top-left** quadrant have high expertise but low interest; "
-                            "**bottom-right** = high interest but skill gap.</small>",
-                            elem_classes=["legend-note"],
-                        )
-
-                    # ── Sub-tab E: Individual Comparison ─────────────────
                     with gr.Tab("Individual Comparison"):
                         with gr.Row():
-                            individual_dd = gr.Dropdown(
-                                choices=[],
-                                label="Researcher",
-                                scale=2,
-                            )
-                            gr.Markdown("", scale=3)   # spacer
-
+                            individual_dd = gr.Dropdown(choices=[], label="Researcher", scale=2)
                         with gr.Row():
                             ind_radar_plot = gr.Plot(
                                 value=charts.empty_figure("Select a researcher above"),
@@ -791,57 +548,44 @@ def build_app() -> gr.Blocks:   # noqa: C901 — intentionally long UI builder
                                 value=charts.empty_figure("Select a researcher above"),
                                 label="Dimension Comparison",
                             )
-
-                    # ── Sub-tab F: Overlay Comparison ─────────────────────
                     with gr.Tab("Overlay Comparison"):
                         overlay_dd = gr.Dropdown(
-                            choices=[],
-                            multiselect=True,
+                            choices=[], multiselect=True,
                             label="Select researchers to overlay",
                         )
                         overlay_plot = gr.Plot(
                             value=charts.empty_figure("Select researchers above"),
                             label="Multi-Researcher Overlay Radar",
                         )
-
-                    # ── Sub-tab G: Deep Tech Voices ───────────────────────
                     with gr.Tab("Deep Tech Voices"):
                         voices_md = gr.Markdown("_No responses yet._")
 
             # ═══════════════════════════════════════════════════════════════
-            # TAB 6 — Technology Radar  (ThoughtWorks-style)
+            # TAB 3 — Technology Radar
             # ═══════════════════════════════════════════════════════════════
-            with gr.Tab("6 · Technology Radar", id="tab_tw"):
+            with gr.Tab("3 · Technology Radar", id="tab_tw"):
 
                 gr.Markdown(
-                    "**Dual radar:** the **Group** view is a *Technology Radar* — it shows "
-                    "where the team collectively sits on each deep tech area (adoption readiness). "
-                    "The **Individual** view is a *Skill Radar* — it maps a single person's "
-                    "proficiency across all areas.  "
-                    "Ring placement is driven by the average of *Expertise* and *Contribute* scores.\n\n"
-                    "_Inspired by [ThoughtWorks Technology Radar](https://www.thoughtworks.com/radar) "
-                    "and the [Skill Radar adaptation](https://lihsmi.ch/learning/2015/04/25/skill-radar-technology-radar.html)._"
+                    "**Group** view = Technology Radar (collective adoption readiness).  "
+                    "**Individual** view = Skill Radar (personal proficiency).  "
+                    "Ring placement driven by avg(Expertise + Contribute)."
                 )
 
                 with gr.Row(equal_height=True):
-                    tw_view_radio    = gr.Radio(
+                    tw_view_radio = gr.Radio(
                         choices=["Group", "Individual"],
                         value="Group",
                         label="View mode",
-                        info="Group = Technology Radar  |  Individual = Skill Radar",
                         scale=2,
                     )
                     tw_researcher_dd = gr.Dropdown(
-                        choices=[],
-                        label="Researcher (Individual view)",
-                        visible=False,
-                        scale=2,
+                        choices=[], label="Researcher (Individual view)",
+                        visible=False, scale=2,
                     )
                     tw_dim_dd = gr.Dropdown(
                         choices=list(zip(_DIM_LABELS, _DIM_CHOICES)),
                         value="contribute",
                         label="Ring dimension",
-                        info="Which score drives ring placement",
                         scale=2,
                     )
                     tw_refresh_btn = gr.Button("Refresh Radar", variant="primary", scale=1)
@@ -850,25 +594,20 @@ def build_app() -> gr.Blocks:   # noqa: C901 — intentionally long UI builder
                     value=radar_viz.empty_tw_figure(),
                     label="Technology / Skill Radar",
                 )
-
-                tw_blip_legend_md = gr.Markdown(
-                    "_Blip legend appears here after refresh._",
-                    label="Blip index",
-                )
+                tw_blip_legend_md = gr.Markdown("_Blip legend appears here after refresh._")
                 tw_custom_areas_md = gr.Markdown("")
                 gr.Markdown(radar_viz.build_tw_legend_table())
 
             # ═══════════════════════════════════════════════════════════════
-            # TAB 7 — AI Research Assistant
+            # TAB 4 — AI Insights
             # ═══════════════════════════════════════════════════════════════
-            with gr.Tab("7 · AI Research Assistant", id="tab_ai"):
+            with gr.Tab("4 · AI Insights", id="tab_ai"):
 
                 gr.Markdown(
-                    f"Powered by **Ollama** (`{OLLAMA_MODEL}`).  "
+                    f"Powered by **OpenAI** (`{OPENAI_MODEL}`).  "
                     "The agent reads the live radar data and vision responses, then generates "
-                    "actionable insights — synergies, project ideas, funding proposals, skill gaps, "
-                    "or a competence roadmap.\n\n"
-                    "**Before using:** run `ollama serve` and `ollama pull gemma3` in a terminal."
+                    "actionable insights — synergies, project ideas, funding proposals, "
+                    "skill gaps, or a competence roadmap."
                 )
 
                 with gr.Row(equal_height=True):
@@ -895,13 +634,13 @@ def build_app() -> gr.Blocks:   # noqa: C901 — intentionally long UI builder
                 extra_input = gr.Textbox(
                     label="Additional context  (optional)",
                     placeholder=(
-                        'For "Project Ideas": specify focus areas.  '
-                        'For "Project Proposal": paste the idea title here.'
+                        'For "Project Proposal": paste the idea title here.  '
+                        'For "Project Ideas": specify focus areas.'
                     ),
                     lines=2,
                 )
 
-                ollama_status = gr.Markdown("", elem_classes=["status-info"])
+                openai_status = gr.Markdown("", elem_classes=["status-info"])
                 ai_output     = gr.Markdown(
                     "_Select an agent and click **Run Agent** to see insights._"
                 )
@@ -910,209 +649,165 @@ def build_app() -> gr.Blocks:   # noqa: C901 — intentionally long UI builder
         # Event wiring
         # ─────────────────────────────────────────────────────────────────
 
-        # ── Shared: all session-restore outputs ──────────────────────────
-        # Must match _default_session_outputs() / _restore_session_outputs() tuples:
-        # 1  current_areas_state
-        # 2  scholar_source_state
-        # 3  session_status_msg
-        # 4  tags_cg
-        # 5  tag_choices_state
-        # 6  tag_input              (clear on restore)
-        # 7  vision_def_tb
-        # 8  vision_ex_tb
-        # 9  vision_exp_tb
-        # 10-24  area_accordions    (15)
-        # 25-39  interest_sliders   (15)
-        # 40-54  expertise_sliders  (15)
-        # 55-69  contribute_sliders (15)
-
-        _session_outputs = [
-            current_areas_state,
-            scholar_source_state,
-            session_status_msg,
-            tags_cg,
-            tag_choices_state,
-            tag_input,
-            vision_def_tb, vision_ex_tb, vision_exp_tb,
-            *area_accordions,
-            *interest_sliders,
-            *expertise_sliders,
-            *contribute_sliders,
-        ]
-
-        # Researcher selection → restore session
-        name_dropdown.change(
-            fn=on_researcher_selected,
-            inputs=[name_dropdown, custom_name_tb],
-            outputs=_session_outputs,
-        )
-
-        # ── Tab 1: Scholar lookup ─────────────────────────────────────────
-        lookup_btn.click(
-            fn=on_scholar_lookup,
-            inputs=[name_dropdown, custom_name_tb, scholar_url_tb],
-            outputs=[scholar_source_state, tag_choices_state, tags_cg,
-                     scholar_status_msg, paper_count_txt],
-        )
-
-        add_tag_btn.click(
-            fn=on_add_manual_tag,
-            inputs=[tag_input, tag_choices_state],
-            outputs=[tag_choices_state, tags_cg, tag_input],
-        )
-
-        # ── Tab 2: Custom area management ────────────────────────────────
-        add_area_btn.click(
-            fn=on_add_custom_area,
-            inputs=[custom_area_input, current_areas_state],
-            outputs=[current_areas_state, area_add_status, custom_area_input,
-                     *area_accordions],
-        )
-
-        remove_area_btn.click(
-            fn=on_remove_custom_area,
-            inputs=[current_areas_state],
-            outputs=[current_areas_state, area_add_status, *area_accordions],
-        )
-
-        # ── Tab 2: Live radar (fires on every slider change) ─────────────
-        all_sliders = interest_sliders + expertise_sliders + contribute_sliders
-        gr.on(
-            triggers=[s.change for s in all_sliders],
-            fn=on_slider_change,
-            inputs=[current_areas_state] + all_sliders,
-            outputs=[radar_preview],
-        )
-
-        # ── Tab 4: Preview and submit ─────────────────────────────────────
-        _preview_inputs = [
-            name_dropdown, custom_name_tb,
-            tags_cg, scholar_source_state,
-            current_areas_state,
-            vision_def_tb, vision_ex_tb, vision_exp_tb,
+        all_sliders    = interest_sliders + expertise_sliders + contribute_sliders
+        _name_outputs  = [
+            fetch_status_md,
+            current_ratings_state, scholar_source_state, scholar_tags_state,
+            radar_preview,
+            no_scholar_section,
+            fine_tune_accordion,
             *interest_sliders, *expertise_sliders, *contribute_sliders,
         ]
 
-        preview_btn.click(
-            fn=on_generate_preview,
-            inputs=_preview_inputs,
-            outputs=[preview_code, preview_status],
+        # Tab 1: name selection → auto-fetch
+        name_dropdown.change(
+            fn=on_name_selected,
+            inputs=[name_dropdown, scholar_url_map_state],
+            outputs=_name_outputs,
         )
 
+        # Tab 1: text-based inference (no-Scholar path)
+        _text_infer_outputs = [
+            current_ratings_state, radar_preview, text_infer_status_md,
+            fine_tune_accordion,
+            *interest_sliders, *expertise_sliders, *contribute_sliders,
+        ]
+        infer_text_btn.click(
+            fn=on_infer_from_text,
+            inputs=[research_text_tb],
+            outputs=_text_infer_outputs,
+        )
+
+        # Tab 1: re-infer from Scholar (reset sliders)
+        _reinfer_outputs = [
+            current_ratings_state, radar_preview,
+            *interest_sliders, *expertise_sliders, *contribute_sliders,
+        ]
+        reinfer_btn.click(
+            fn=on_reinfer_from_scholar,
+            inputs=[scholar_tags_state, scholar_url_map_state, name_dropdown],
+            outputs=_reinfer_outputs,
+        )
+
+        # Tab 1: live radar updates on any slider change
+        gr.on(
+            triggers=[s.change for s in all_sliders],
+            fn=on_slider_change,
+            inputs=[current_ratings_state] + all_sliders,
+            outputs=[current_ratings_state, radar_preview],
+        )
+
+        # Tab 1: submit
         submit_btn.click(
-            fn=on_submit,
-            inputs=[preview_code],
-            outputs=[submit_status],
-        )
-
-        # ── Tab 5: Dashboard refresh ─────────────────────────────────────
-        refresh_btn.click(
-            fn=on_dashboard_refresh,
-            inputs=[dim_dropdown],
-            outputs=[
-                agg_radar_plot, heatmap_plot, contrib_bar_plot, bubble_plot,
-                voices_md, dashboard_status,
-                individual_dd,
+            fn=on_confirm_submit,
+            inputs=[
+                name_dropdown, scholar_tags_state, scholar_source_state,
+                current_ratings_state,
+                vision_def_tb, vision_ex_tb, vision_exp_tb,
             ],
+            outputs=[submit_status_md],
         )
 
-        # Dimension selector changes group-level charts
-        dim_dropdown.change(
-            fn=on_dashboard_refresh,
-            inputs=[dim_dropdown],
-            outputs=[
-                agg_radar_plot, heatmap_plot, contrib_bar_plot, bubble_plot,
-                voices_md, dashboard_status,
-                individual_dd,
-            ],
-        )
-
-        # Individual researcher charts
+        # Tab 2: dashboard refresh
+        _dash_outputs = [
+            agg_radar_plot, heatmap_plot, contrib_bar_plot, bubble_plot,
+            voices_md, dashboard_status, individual_dd,
+        ]
+        refresh_btn.click(fn=on_dashboard_refresh, inputs=[dim_dropdown], outputs=_dash_outputs)
+        dim_dropdown.change(fn=on_dashboard_refresh, inputs=[dim_dropdown], outputs=_dash_outputs)
         individual_dd.change(
             fn=on_individual_researcher_change,
             inputs=[individual_dd, dim_dropdown],
             outputs=[ind_radar_plot, ind_bar_plot],
         )
-
-        # Overlay radar
         overlay_dd.change(
             fn=on_overlay_update,
             inputs=[overlay_dd, dim_dropdown],
             outputs=[overlay_plot],
         )
+        export_btn.click(fn=on_export_csv, inputs=[], outputs=[export_file])
 
-        # Export CSV
-        export_btn.click(
-            fn=on_export_csv,
-            inputs=[],
-            outputs=[export_file],
-        )
-
-        # ── Tab 6: Technology / Skill Radar ───────────────────────────────
+        # Tab 3: TW radar
         tw_refresh_btn.click(
             fn=on_tw_radar_refresh,
             inputs=[tw_view_radio, tw_researcher_dd, tw_dim_dd],
             outputs=[tw_radar_plot, tw_blip_legend_md, tw_custom_areas_md, tw_researcher_dd],
         )
-
-        tw_view_radio.change(
-            fn=on_tw_view_change,
-            inputs=[tw_view_radio],
-            outputs=[tw_researcher_dd],
-        )
-
-        # Re-render when researcher or dimension changes (Individual view)
+        tw_view_radio.change(fn=on_tw_view_change, inputs=[tw_view_radio], outputs=[tw_researcher_dd])
         tw_researcher_dd.change(
             fn=on_tw_radar_refresh,
             inputs=[tw_view_radio, tw_researcher_dd, tw_dim_dd],
             outputs=[tw_radar_plot, tw_blip_legend_md, tw_custom_areas_md, tw_researcher_dd],
         )
-
         tw_dim_dd.change(
             fn=on_tw_radar_refresh,
             inputs=[tw_view_radio, tw_researcher_dd, tw_dim_dd],
             outputs=[tw_radar_plot, tw_blip_legend_md, tw_custom_areas_md, tw_researcher_dd],
         )
 
-        # ── Tab 7: AI Research Assistant ──────────────────────────────────
+        # Tab 4: AI Insights
         ai_run_btn.click(
             fn=stream_agent_response,
             inputs=[agent_dd, extra_input],
-            outputs=[ollama_status, ai_output],
+            outputs=[openai_status, ai_output],
         )
-
         ai_clr_btn.click(
             fn=lambda: ("", "_Select an agent and click **Run Agent** to see insights._"),
             inputs=[],
-            outputs=[ollama_status, ai_output],
+            outputs=[openai_status, ai_output],
         )
 
     return demo
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Styling
+# CSS
 # ─────────────────────────────────────────────────────────────────────────────
 
 _CSS = """
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+
+body, .gradio-container {
+    font-family: 'Inter', system-ui, sans-serif !important;
+}
 .app-header {
     text-align: center;
-    margin-bottom: 0.5rem;
+    margin-bottom: 0.6rem;
 }
 .app-header h1 {
-    font-size: 1.9rem;
-    color: #1a3a5c;
+    font-size: 2rem;
+    font-weight: 700;
+    color: #1a2332;
+    letter-spacing: -0.02em;
+}
+.app-header p {
+    color: #555;
+    font-size: 0.95rem;
 }
 .status-info {
     font-size: 0.88rem;
-    color: #555;
-    padding: 0.2rem 0;
-    min-height: 1.2rem;
+    color: #444;
+    padding: 0.3rem 0;
+    min-height: 1.4rem;
 }
 .legend-note {
     font-size: 0.82rem;
     color: #666;
-    padding-top: 0.4rem;
+    padding-top: 0.3rem;
+}
+.radar-container {
+    border: 1px solid #e8edf3;
+    border-radius: 12px;
+    padding: 6px;
+    background: rgba(248, 250, 252, 0.6);
+}
+.submit-btn-large button {
+    font-size: 1.1rem !important;
+    font-weight: 600 !important;
+    padding: 0.75rem 2.5rem !important;
+    border-radius: 10px !important;
+    letter-spacing: 0.01em;
+    margin-top: 0.8rem;
 }
 """
 
@@ -1124,13 +819,23 @@ _CSS = """
 if __name__ == "__main__":
     share_flag = "--share" in sys.argv
 
-    # Authenticate with HuggingFace (non-fatal if token missing)
     storage.authenticate_hf()
 
-    app = build_app()
+    log.info("Building Google Scholar URL → team member mapping (this may take ~30s)…")
+    url_map = scholar.build_scholar_url_mapping()
+    log.info("Scholar URL mapping complete: %d entries mapped", sum(1 for v in url_map.values() if v))
+
+    app = build_app(url_map)
     app.launch(
         server_name="0.0.0.0",
         server_port=7860,
         share=share_flag,
         show_error=True,
+        theme=gr.themes.Soft(
+            primary_hue="blue",
+            secondary_hue="teal",
+            neutral_hue="slate",
+            font=[gr.themes.GoogleFont("Inter"), "sans-serif"],
+        ),
+        css=_CSS,
     )

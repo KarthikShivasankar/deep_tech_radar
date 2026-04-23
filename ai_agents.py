@@ -1,36 +1,27 @@
 """
-ai_agents.py — AI Research Assistant powered by Ollama (OpenAI-compatible API).
+ai_agents.py — AI Research Assistant powered by OpenAI GPT.
 
 Five streaming agents that analyse the group's skill radar data and surface
 actionable insights: team synergies, project ideas, funding proposals, skill
 gaps, and a competence development roadmap.
 
-Model: configured via OLLAMA_MODEL in config.py (default: gemma3:latest).
-API:   Ollama's OpenAI-compatible endpoint at OLLAMA_BASE_URL.
-
-Usage:
-    ollama pull gemma3        # once
-    ollama serve              # keep running while the app is open
-
-Each stream_* function is a generator that yields the *accumulated* response
-text so Gradio can stream it live into a gr.Markdown component.
+Model: configured via OPENAI_MODEL in config.py / .env (default: gpt-4o-mini).
+       Set OPENAI_MODEL=gpt-5-nano once that model ID is available.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 from typing import Iterator
 
 import pandas as pd
-import requests
 
 from config import (
     DEFAULT_TECH_AREAS,
     DIMENSIONS,
-    OLLAMA_BASE_URL,
-    OLLAMA_MODEL,
-    OLLAMA_TIMEOUT,
+    OPENAI_API_KEY,
+    OPENAI_MODEL,
+    OPENAI_TIMEOUT,
     TW_QUADRANTS,
     TW_RINGS,
     TW_RING_THRESHOLDS,
@@ -38,43 +29,26 @@ from config import (
 
 log = logging.getLogger(__name__)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Ollama health check
-# ─────────────────────────────────────────────────────────────────────────────
-
-def check_ollama() -> tuple[bool, str]:
-    """
-    Ping the Ollama server to verify it is reachable.
-
-    Returns (ok: bool, message: str).
-    """
-    base = OLLAMA_BASE_URL.replace("/v1", "").rstrip("/")
-    try:
-        resp = requests.get(f"{base}/api/tags", timeout=5)
-        if resp.status_code == 200:
-            models = [m.get("name", "") for m in resp.json().get("models", [])]
-            if not models:
-                return True, "Ollama running but no models pulled yet. Run: ollama pull gemma3"
-            if not any(OLLAMA_MODEL.split(":")[0] in m for m in models):
-                return True, (
-                    f"Ollama running. Model '{OLLAMA_MODEL}' not found. "
-                    f"Available: {', '.join(models[:5])}. Run: ollama pull {OLLAMA_MODEL}"
-                )
-            return True, f"Ollama ready — using {OLLAMA_MODEL}"
-        return False, f"Ollama returned HTTP {resp.status_code}"
-    except requests.exceptions.ConnectionError:
-        return False, f"Cannot connect to {base}. Run: ollama serve"
-    except Exception as exc:
-        return False, str(exc)
-
 
 # ─────────────────────────────────────────────────────────────────────────────
-# OpenAI client
+# OpenAI client & health check
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _get_client():
-    from openai import OpenAI   # imported lazily so the app starts without openai
-    return OpenAI(base_url=OLLAMA_BASE_URL, api_key="ollama")
+    from openai import OpenAI
+    return OpenAI(api_key=OPENAI_API_KEY)
+
+
+def check_openai() -> tuple[bool, str]:
+    """Verify OpenAI API key and model accessibility."""
+    if not OPENAI_API_KEY:
+        return False, "OPENAI_API_KEY not set in .env"
+    try:
+        client = _get_client()
+        client.models.retrieve(OPENAI_MODEL)
+        return True, f"OpenAI ready — using {OPENAI_MODEL}"
+    except Exception as exc:
+        return False, str(exc)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -82,7 +56,6 @@ def _get_client():
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _ring_name(expertise, contribute) -> str:
-    """Return ring label for a pair of scores."""
     try:
         avg = (float(expertise) + float(contribute)) / 2
     except (TypeError, ValueError):
@@ -94,48 +67,34 @@ def _ring_name(expertise, contribute) -> str:
 
 
 def _build_radar_context(df: pd.DataFrame, vision_data: list[dict]) -> str:
-    """
-    Format radar + vision data as a concise text block for the LLM.
-
-    Structure:
-      1. Group summary: n researchers, submission count
-      2. Tech area table: area | quadrant | avg scores | ring | n_researchers
-      3. Researcher table: name | top 3 areas by contribute score
-      4. Deep tech vision excerpts (first 120 chars each to stay within token budget)
-
-    Kept intentionally compact (~1500 tokens) to leave room for the model's response.
-    """
     sections: list[str] = []
 
-    # ── Group summary ─────────────────────────────────────────────────────
     n_people = df["researcher"].nunique() if not df.empty else 0
     sections.append(f"**Group:** {n_people} researchers rated deep tech areas.\n")
 
-    # ── Tech area table ───────────────────────────────────────────────────
     if not df.empty:
         area_stats: dict[str, dict] = {}
         for area in df["tech_area"].unique():
             sub = df[df["tech_area"] == area]
-            # find quadrant
             quadrant = "Other"
             for q_name, q_data in TW_QUADRANTS.items():
                 if area in q_data["areas"]:
                     quadrant = q_name
                     break
             area_stats[area] = {
-                "quadrant":  quadrant,
-                "interest":  round(sub["interest"].mean(), 1) if "interest" in sub else "–",
-                "expertise": round(sub["expertise"].mean(), 1) if "expertise" in sub else "–",
-                "contribute":round(sub["contribute"].mean(), 1) if "contribute" in sub else "–",
-                "ring":      _ring_name(
+                "quadrant":   quadrant,
+                "interest":   round(sub["interest"].mean(), 1) if "interest" in sub else "–",
+                "expertise":  round(sub["expertise"].mean(), 1) if "expertise" in sub else "–",
+                "contribute": round(sub["contribute"].mean(), 1) if "contribute" in sub else "–",
+                "ring":       _ring_name(
                     sub["expertise"].mean() if "expertise" in sub else 3,
                     sub["contribute"].mean() if "contribute" in sub else 3,
                 ),
                 "n": len(sub),
             }
 
-        rows = ["Area | Quadrant | Ring | Interest | Expertise | Contribute | N"]
-        rows.append("---|---|---|---|---|---|---")
+        rows = ["Area | Quadrant | Ring | Interest | Expertise | Contribute | N",
+                "---|---|---|---|---|---|---"]
         for area, s in area_stats.items():
             rows.append(
                 f"{area} | {s['quadrant']} | {s['ring']} | "
@@ -143,9 +102,7 @@ def _build_radar_context(df: pd.DataFrame, vision_data: list[dict]) -> str:
             )
         sections.append("**Tech Area Scores (group averages):**\n" + "\n".join(rows) + "\n")
 
-        # ── Per-researcher top areas ──────────────────────────────────────
-        researcher_rows = ["Researcher | Top contribute areas (score)"]
-        researcher_rows.append("---|---")
+        researcher_rows = ["Researcher | Top contribute areas (score)", "---|---"]
         for researcher in sorted(df["researcher"].unique()):
             sub_r = df[df["researcher"] == researcher].sort_values("contribute", ascending=False)
             top   = ", ".join(
@@ -156,10 +113,9 @@ def _build_radar_context(df: pd.DataFrame, vision_data: list[dict]) -> str:
             researcher_rows.append(f"{researcher} | {top}")
         sections.append("**Researcher priorities:**\n" + "\n".join(researcher_rows) + "\n")
 
-    # ── Vision excerpts ───────────────────────────────────────────────────
     if vision_data:
         excerpts = []
-        for entry in vision_data[:8]:   # cap at 8 to limit token use
+        for entry in vision_data[:8]:
             name = entry.get("researcher", "")
             defn = (entry.get("definition") or "")[:120]
             expl = (entry.get("explore") or "")[:80]
@@ -285,32 +241,26 @@ _AGENT_PROMPTS: dict[str, str] = {
 # Generic streaming runner
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _stream(
-    system_prompt: str,
-    user_message: str,
-) -> Iterator[str]:
-    """
-    Stream a response from Ollama.  Yields accumulated text each chunk.
-    On error, yields the error message as the final chunk.
-    """
-    client = _get_client()
+def _stream(system_prompt: str, user_message: str) -> Iterator[str]:
+    """Stream a response from OpenAI. Yields accumulated text each chunk."""
+    client      = _get_client()
     accumulated = ""
     try:
         stream = client.chat.completions.create(
-            model=OLLAMA_MODEL,
+            model=OPENAI_MODEL,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user",   "content": user_message},
             ],
             stream=True,
-            timeout=OLLAMA_TIMEOUT,
+            timeout=OPENAI_TIMEOUT,
         )
         for chunk in stream:
             delta = (chunk.choices[0].delta.content or "") if chunk.choices else ""
             accumulated += delta
             yield accumulated
     except Exception as exc:
-        log.error("Ollama stream error: %s", exc)
+        log.error("OpenAI stream error: %s", exc)
         yield accumulated + f"\n\n⚠ **Error:** {exc}"
 
 
@@ -318,53 +268,30 @@ def _stream(
 # Public agent functions
 # ─────────────────────────────────────────────────────────────────────────────
 
-def stream_synergies(
-    df: pd.DataFrame,
-    vision_data: list[dict],
-    extra: str = "",
-) -> Iterator[str]:
-    """Identify collaboration pairs/teams based on complementary radar scores."""
-    context = _build_radar_context(df, vision_data)
+def stream_synergies(df: pd.DataFrame, vision_data: list[dict], extra: str = "") -> Iterator[str]:
+    context  = _build_radar_context(df, vision_data)
     user_msg = f"Radar data:\n{context}"
     if extra:
-        user_msg += f"\n\nAdditional context from user: {extra}"
+        user_msg += f"\n\nAdditional context: {extra}"
     yield from _stream(_SYNERGY_PROMPT, user_msg)
 
 
-def stream_project_ideas(
-    df: pd.DataFrame,
-    vision_data: list[dict],
-    extra: str = "",
-) -> Iterator[str]:
-    """Generate 5 fundable project ideas based on the group's skill profile."""
-    context = _build_radar_context(df, vision_data)
+def stream_project_ideas(df: pd.DataFrame, vision_data: list[dict], extra: str = "") -> Iterator[str]:
+    context  = _build_radar_context(df, vision_data)
     user_msg = f"Radar data:\n{context}"
     if extra:
-        user_msg += f"\n\nFocus on these areas or constraints: {extra}"
+        user_msg += f"\n\nFocus on: {extra}"
     yield from _stream(_IDEAS_PROMPT, user_msg)
 
 
-def stream_proposal(
-    df: pd.DataFrame,
-    vision_data: list[dict],
-    extra: str = "",
-) -> Iterator[str]:
-    """Write a structured 1-page proposal for the idea supplied in `extra`."""
+def stream_proposal(df: pd.DataFrame, vision_data: list[dict], extra: str = "") -> Iterator[str]:
     context  = _build_radar_context(df, vision_data)
     idea     = extra.strip() or "the most promising project idea based on the radar data"
-    user_msg = (
-        f"Write a proposal for: **{idea}**\n\n"
-        f"Team radar data:\n{context}"
-    )
+    user_msg = f"Write a proposal for: **{idea}**\n\nTeam radar data:\n{context}"
     yield from _stream(_PROPOSAL_PROMPT, user_msg)
 
 
-def stream_gap_analysis(
-    df: pd.DataFrame,
-    vision_data: list[dict],
-    extra: str = "",
-) -> Iterator[str]:
-    """Identify skill gaps, single-point-of-failure risks, and recommended actions."""
+def stream_gap_analysis(df: pd.DataFrame, vision_data: list[dict], extra: str = "") -> Iterator[str]:
     context  = _build_radar_context(df, vision_data)
     user_msg = f"Radar data:\n{context}"
     if extra:
@@ -372,20 +299,14 @@ def stream_gap_analysis(
     yield from _stream(_GAP_PROMPT, user_msg)
 
 
-def stream_roadmap(
-    df: pd.DataFrame,
-    vision_data: list[dict],
-    extra: str = "",
-) -> Iterator[str]:
-    """Generate a 12-month competence development roadmap for the group."""
+def stream_roadmap(df: pd.DataFrame, vision_data: list[dict], extra: str = "") -> Iterator[str]:
     context  = _build_radar_context(df, vision_data)
     user_msg = f"Radar data:\n{context}"
     if extra:
-        user_msg += f"\n\nPriority constraints: {extra}"
+        user_msg += f"\n\nConstraints: {extra}"
     yield from _stream(_ROADMAP_PROMPT, user_msg)
 
 
-# Mapping used by app.py
 AGENT_FUNCTIONS: dict[str, object] = {
     "Team Synergies":     stream_synergies,
     "Project Ideas":      stream_project_ideas,

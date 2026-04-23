@@ -154,13 +154,13 @@ def get_custom_areas(df: pd.DataFrame) -> list[str]:
 def _add_scaffold(fig: go.Figure) -> None:
     """
     Draw the static radar structure:
-      • Coloured quadrant wedge fills
-      • Gray ring boundary circles
+      • Coloured quadrant wedge fills (4 per ring for gradient effect)
+      • Ring boundary circles with varying opacity
       • Quadrant divider lines
-      • Ring labels (inner edge of each band, at top of chart)
-      • Quadrant title labels (outside outer ring)
+      • Ring labels with pill backgrounds
+      • Quadrant title labels (bold, outside outer ring)
     """
-    # ── Quadrant coloured fills ───────────────────────────────────────────
+    # ── Quadrant coloured fills (one per quadrant, full depth) ───────────
     for q_name, q in TW_QUADRANTS.items():
         x, y = _wedge_xy(0, 1.0, q["angle_start"], q["angle_end"])
         fig.add_trace(go.Scatter(
@@ -174,43 +174,46 @@ def _add_scaffold(fig: go.Figure) -> None:
             name=f"_q_{q_name}",
         ))
 
-    # ── Ring boundary circles ─────────────────────────────────────────────
-    for ring in TW_RINGS:
-        r = ring["r_outer"]
+    # ── Ring boundary circles (outer to inner, increasing opacity) ────────
+    for i, ring in enumerate(TW_RINGS):
+        r  = ring["r_outer"]
         cx, cy = _circle_xy(r)
+        opacity = 0.25 + i * 0.12   # subtle gradient: outer lighter, inner stronger
         fig.add_trace(go.Scatter(
             x=cx, y=cy,
             mode="lines",
-            line=dict(color="#cccccc", width=1),
+            line=dict(color=f"rgba(100,100,120,{opacity:.2f})", width=1.2),
             hoverinfo="skip",
             showlegend=False,
             name=f"_ring_{ring['name']}",
         ))
 
-    # ── Quadrant divider lines ────────────────────────────────────────────
+    # ── Quadrant divider lines ─────────────────────────────────────────────
     for angle_deg in [0, 90, 180, 270]:
         angle_rad = _deg2rad(angle_deg)
         fig.add_shape(
             type="line",
             x0=0, y0=0,
             x1=math.cos(angle_rad), y1=math.sin(angle_rad),
-            line=dict(color="#cccccc", width=1.5, dash="dot"),
+            line=dict(color="rgba(100,100,120,0.3)", width=1.5, dash="dot"),
         )
 
-    # ── Ring labels (displayed at 90° / top of chart) ─────────────────────
+    # ── Ring labels with pill backgrounds ─────────────────────────────────
     for ring, r_mid in zip(TW_RINGS, _RING_LABEL_R):
         fig.add_annotation(
-            x=0,
-            y=r_mid,
+            x=0, y=r_mid,
             text=f"<b>{ring['name']}</b>",
             showarrow=False,
-            font=dict(size=9, color="#777"),
+            font=dict(size=9, color="#555", family="Inter, sans-serif"),
             xanchor="center",
             yanchor="middle",
-            bgcolor="rgba(255,255,255,0.7)",
+            bgcolor="rgba(255,255,255,0.85)",
+            bordercolor="rgba(0,0,0,0.08)",
+            borderwidth=1,
+            borderpad=3,
         )
 
-    # ── Quadrant title labels ─────────────────────────────────────────────
+    # ── Quadrant title labels ──────────────────────────────────────────────
     for q_name, q in TW_QUADRANTS.items():
         angle_rad = _deg2rad(q["label_angle"])
         fig.add_annotation(
@@ -218,7 +221,7 @@ def _add_scaffold(fig: go.Figure) -> None:
             y=_LABEL_R * math.sin(angle_rad),
             text=f"<b>{q_name}</b>",
             showarrow=False,
-            font=dict(size=11, color=q["color"]),
+            font=dict(size=12, color=q["color"], family="Inter, sans-serif"),
             xanchor="center",
             yanchor="middle",
         )
@@ -228,17 +231,21 @@ def _base_layout() -> dict:
     return dict(
         xaxis=dict(range=[-_AXIS_RANGE, _AXIS_RANGE], visible=False, scaleanchor="y", scaleratio=1),
         yaxis=dict(range=[-_AXIS_RANGE, _AXIS_RANGE], visible=False),
-        height=620,
-        margin=dict(t=40, b=20, l=20, r=20),
-        paper_bgcolor="white",
-        plot_bgcolor="white",
+        height=660,
+        margin=dict(t=50, b=20, l=20, r=200),
+        paper_bgcolor="rgba(250,251,253,1)",
+        plot_bgcolor="rgba(250,251,253,1)",
+        font=dict(family="Inter, system-ui, sans-serif", size=12),
         showlegend=True,
         legend=dict(
             orientation="v",
             x=1.02, y=1,
             xanchor="left", yanchor="top",
-            font=dict(size=10),
-            title=dict(text="<b>Ring</b>", font=dict(size=11)),
+            font=dict(size=10, family="Inter, sans-serif"),
+            title=dict(text="<b>Ring Level</b>", font=dict(size=11)),
+            bgcolor="rgba(255,255,255,0.9)",
+            bordercolor="rgba(0,0,0,0.08)",
+            borderwidth=1,
         ),
     )
 
@@ -367,17 +374,22 @@ def _build_group_view(fig: go.Figure, df: pd.DataFrame, dimension: str) -> go.Fi
         fig.add_trace(go.Scatter(
             x=bx, y=by,
             mode="markers+text",
-            marker=dict(size=bsize, color=bcolor, line=dict(color="white", width=1.5)),
+            marker=dict(size=bsize, color=bcolor,
+                        line=dict(color="white", width=2),
+                        opacity=0.92),
             text=btext,
             textposition="middle center",
-            textfont=dict(size=9, color="white", family="Arial Black"),
+            textfont=dict(size=9, color="white", family="Inter Black, Arial Black"),
             hovertext=bhover,
             hoverinfo="text",
             showlegend=False,
             name=q_name,
         ))
 
-    fig.update_layout(**_base_layout(), title=dict(text="Technology Radar — Group View", x=0.5, font=dict(size=16)))
+    fig.update_layout(**_base_layout(), title=dict(
+        text="Technology Radar — Group View",
+        x=0.5, font=dict(size=17, family="Inter, sans-serif", color="#1a2332"),
+    ))
     # Attach legend rows for the table below the chart
     fig._blip_legend = legend_rows   # type: ignore[attr-defined]
     return fig

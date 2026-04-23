@@ -62,35 +62,43 @@ def _close_polygon(
     return values + [values[0]], labels + [labels[0]]
 
 
+_FONT = dict(family="Inter, system-ui, sans-serif", size=13, color="#1a2332")
+
+
 def _radar_layout(title: str, height: int = 480) -> dict:
     """Shared layout dict for all radar/spider charts."""
     return dict(
-        title=dict(text=title, font=dict(size=15, color="#333"), x=0.5),
+        title=dict(text=title, font=dict(family="Inter, sans-serif", size=16, color="#1a2332"), x=0.5),
+        font=_FONT,
         polar=dict(
             radialaxis=dict(
                 visible=True,
                 range=[SLIDER_MIN - 0.3, SLIDER_MAX + 0.3],
                 tickvals=list(range(SLIDER_MIN, SLIDER_MAX + 1)),
-                tickfont=dict(size=9),
-                gridcolor="#e8e8e8",
-                linecolor="#ccc",
+                ticktext=["1", "2", "3", "4", "5"],
+                tickfont=dict(size=9, color="#888"),
+                gridcolor="rgba(0,0,0,0.07)",
+                linecolor="rgba(0,0,0,0.12)",
             ),
             angularaxis=dict(
-                tickfont=dict(size=10),
-                linecolor="#ccc",
-                gridcolor="#e8e8e8",
+                tickfont=dict(size=11, color="#333"),
+                linecolor="rgba(0,0,0,0.12)",
+                gridcolor="rgba(0,0,0,0.07)",
             ),
-            bgcolor="rgba(250,250,250,0.5)",
+            bgcolor="rgba(248,250,252,0.8)",
         ),
         showlegend=True,
         legend=dict(
             orientation="h",
-            yanchor="bottom", y=-0.28,
+            yanchor="bottom", y=-0.30,
             xanchor="center", x=0.5,
-            font=dict(size=11),
+            font=dict(size=12),
+            bgcolor="rgba(255,255,255,0.8)",
+            bordercolor="rgba(0,0,0,0.1)",
+            borderwidth=1,
         ),
         height=height,
-        margin=dict(t=70, b=90, l=70, r=70),
+        margin=dict(t=72, b=100, l=72, r=72),
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
     )
@@ -336,16 +344,18 @@ def build_heatmap(
             z=pivot.values,
             x=pivot.columns.tolist(),
             y=pivot.index.tolist(),
-            colorscale="Viridis",
+            colorscale="RdYlGn",
             zmin=SLIDER_MIN,
             zmax=SLIDER_MAX,
             text=text_arr.values,
-            texttemplate="%{text}",
-            hovertemplate="%{y} / %{x}: %{z:.1f}<extra></extra>",
+            texttemplate="<b>%{text}</b>",
+            textfont=dict(size=11),
+            hovertemplate="<b>%{y}</b><br>%{x}<br>Score: <b>%{z:.1f}</b><extra></extra>",
             colorbar=dict(
-                title=dict(text=DIMENSIONS.get(dimension, dimension), side="right"),
-                thickness=14,
+                title=dict(text=DIMENSIONS.get(dimension, dimension), side="right", font=dict(size=12)),
+                thickness=16,
                 len=0.8,
+                tickfont=dict(size=10),
             ),
         ))
 
@@ -353,12 +363,13 @@ def build_heatmap(
         fig.update_layout(
             title=dict(
                 text=f"Heatmap — {DIMENSIONS.get(dimension, dimension)}",
-                font=dict(size=15), x=0.5,
+                font=dict(family="Inter, sans-serif", size=16, color="#1a2332"), x=0.5,
             ),
-            height=max(380, 52 * n_researchers + 140),
-            xaxis=dict(tickangle=-38, tickfont=dict(size=10), side="bottom"),
+            font=_FONT,
+            height=max(380, 54 * n_researchers + 160),
+            xaxis=dict(tickangle=-40, tickfont=dict(size=10), side="bottom"),
             yaxis=dict(tickfont=dict(size=11), autorange="reversed"),
-            margin=dict(t=70, b=160, l=180, r=80),
+            margin=dict(t=70, b=170, l=190, r=80),
             paper_bgcolor="rgba(0,0,0,0)",
         )
         return fig
@@ -513,14 +524,29 @@ def build_interest_vs_expertise_bubble(df: pd.DataFrame) -> go.Figure:
     fig.add_hline(y=mid, line_dash="dot", line_color="#ccc", opacity=0.7)
     fig.add_vline(x=mid, line_dash="dot", line_color="#ccc", opacity=0.7)
 
-    fig.update_traces(textposition="top center", textfont_size=9)
+    mid = (SLIDER_MIN + SLIDER_MAX) / 2
+    # Quadrant labels
+    for (tx, ty, label) in [
+        (SLIDER_MIN + 0.2, SLIDER_MAX - 0.15, "High Interest<br>Low Expertise"),
+        (SLIDER_MAX - 0.15, SLIDER_MAX - 0.15, "High Interest<br>High Expertise"),
+        (SLIDER_MIN + 0.2, SLIDER_MIN + 0.15, "Low Interest<br>Low Expertise"),
+        (SLIDER_MAX - 0.15, SLIDER_MIN + 0.15, "Low Interest<br>High Expertise"),
+    ]:
+        fig.add_annotation(
+            x=tx, y=ty, text=f"<i style='color:#aaa;font-size:9px'>{label}</i>",
+            showarrow=False, xref="x", yref="y",
+            align="center", font=dict(size=9, color="#aaa"),
+        )
+
+    fig.update_traces(textposition="top center", textfont_size=9, marker=dict(opacity=0.85, line=dict(width=1.5, color="#fff")))
     fig.update_layout(
+        font=_FONT,
         height=520,
         margin=dict(t=70, b=60, l=80, r=60),
-        title=dict(font=dict(size=15), x=0.5),
+        title=dict(font=dict(family="Inter, sans-serif", size=16, color="#1a2332"), x=0.5),
         coloraxis_colorbar=dict(
-            title=DIMENSIONS.get("contribute", "Contribute"),
-            thickness=14,
+            title=dict(text=DIMENSIONS.get("contribute", "Contribute"), font=dict(size=12)),
+            thickness=16,
         ),
         paper_bgcolor="rgba(0,0,0,0)",
     )
